@@ -25,6 +25,16 @@ public:
         return !active_contacts_.empty() || button_down_;
     }
 
+    /*
+     * Release every contact and every button immediately, without ending the
+     * session. Needed whenever forwarding stops for a reason other than a
+     * finger lift: the driver keeps the last report it was given, so a finger
+     * or a button would stay latched until the next real frame arrives.
+     */
+    [[nodiscard]] MTP_IOCTL_FRAME ForceRelease() {
+        return ReleaseAll(previous_sequence_, false);
+    }
+
 private:
     struct ActiveContact {
         std::uint16_t contact_id{};

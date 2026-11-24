@@ -6,15 +6,19 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <Windows.h>
+#include <TlHelp32.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cwctype>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -43,6 +47,178 @@ public:
     [[nodiscard]] HANDLE get() const { return value_; }
 private:
     HANDLE value_;
+};
+
+std::string Narrow(std::wstring_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const wchar_t character : text) {
+        out.push_back(character >= 0 && character < 128 ? static_cast<char>(character) : '?');
+    }
+    return out;
+}
+
+std::wstring Lowercase(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(character)));
+    });
+    return text;
+}
+
+std::wstring Widen(std::string_view text) {
+    if (text.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                         static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) return {};
+    std::wstring out(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        out.data(), size);
+    return out;
+}
+
+std::vector<DWORD> FindProcessIds(const std::vector<std::wstring>& lowercase_names) {
+    std::vector<DWORD> found;
+    if (lowercase_names.empty()) return found;
+    const Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot.valid()) return found;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot.get(), &entry) != FALSE) {
+        do {
+            std::wstring candidate = Lowercase(entry.szExeFile);
+            if (candidate.size() > 4 &&
+                candidate.compare(candidate.size() - 4, 4, L".exe") == 0) {
+                candidate.resize(candidate.size() - 4);
+            }
+            for (const std::wstring& name : lowercase_names) {
+                if (candidate == name) {
+                    found.push_back(entry.th32ProcessID);
+                    break;
+                }
+            }
+        } while (Process32NextW(snapshot.get(), &entry) != FALSE);
+    }
+    return found;
+}
+
+DWORD ParentProcessId(DWORD process_id) {
+    if (process_id == 0) return 0;
+    const Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot.valid()) return 0;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    DWORD found = 0;
+    if (Process32FirstW(snapshot.get(), &entry) != FALSE) {
+        do {
+            if (entry.th32ProcessID == process_id) {
+                found = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot.get(), &entry) != FALSE);
+    }
+    return found;
+}
+
+/*
+ * Optional foreground gate. Two-finger input only makes sense while the player
+ * owns the screen: when Moonlight loses focus its window keeps rendering, but
+ * the pointer now belongs to a local window, so forwarding contacts would move
+ * the local cursor and click on whatever happens to be in front.
+ *
+ * Enabled with --gate <process>. Empty means "always forward", which is the
+ * behaviour every earlier build had.
+ */
+class FocusGate {
+public:
+    explicit FocusGate(std::wstring process) : process_(Lowercase(std::move(process))) {
+        if (process_.empty()) return;
+        std::size_t start = 0;
+        while (start <= process_.size()) {
+            const std::size_t comma = process_.find(L',', start);
+            std::wstring name = process_.substr(start, comma == std::wstring::npos
+                                                           ? std::wstring::npos
+                                                           : comma - start);
+            while (!name.empty() && (name.back() == L' ' || name.back() == L'\t')) name.pop_back();
+            while (!name.empty() && (name.front() == L' ' || name.front() == L'\t')) name.erase(0, 1);
+            if (!name.empty()) names_.push_back(std::move(name));
+            if (comma == std::wstring::npos) break;
+            start = comma + 1;
+        }
+        if (names_.empty()) {
+            process_.clear();
+            return;
+        }
+        interactive_ = RunningOnInteractiveSession();
+        std::cout << "focus gate armed for '";
+        for (std::size_t index = 0; index < names_.size(); ++index) {
+            if (index != 0) std::cout << ',';
+            std::cout << Narrow(names_[index]);
+        }
+        std::cout << "' (session " << CurrentSessionId()
+                  << (interactive_ ? ", interactive" : ", non-interactive: focus check disabled")
+                  << ")\n";
+        if (!interactive_) {
+            std::cout << "warning: this process cannot see the user's desktop, so the gate "
+                         "can only check that the player is running, not that it has focus\n";
+        }
+        allowed_ = Evaluate();
+        std::cout << "focus gate is " << (allowed_ ? "open" : "closed") << " now\n";
+        std::cout.flush();
+    }
+
+    [[nodiscard]] bool enabled() const noexcept { return !names_.empty(); }
+
+    [[nodiscard]] bool allowed() {
+        if (names_.empty()) return true;
+        const ULONGLONG now = GetTickCount64();
+        if (last_check_ != 0 && now - last_check_ < kPollMilliseconds) return allowed_;
+        last_check_ = now;
+        const bool value = Evaluate();
+        if (value != allowed_) {
+            allowed_ = value;
+            std::cout << (value ? "focus gate open: player window is foreground\n"
+                                : "focus gate closed: player window is not foreground\n");
+            std::cout.flush();
+        }
+        return allowed_;
+    }
+
+private:
+    static constexpr ULONGLONG kPollMilliseconds = 100;
+
+    static DWORD CurrentSessionId() {
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        return session;
+    }
+
+    static bool RunningOnInteractiveSession() {
+        const DWORD session = CurrentSessionId();
+        return session != 0 && session == WTSGetActiveConsoleSessionId();
+    }
+
+    [[nodiscard]] bool Evaluate() const {
+        const std::vector<DWORD> targets = FindProcessIds(names_);
+        if (targets.empty()) return false;
+        if (!interactive_) return true;
+        const HWND foreground = GetForegroundWindow();
+        if (foreground == nullptr) return false;
+        DWORD owner = 0;
+        GetWindowThreadProcessId(foreground, &owner);
+        const auto owns = [&targets](DWORD id) {
+            return std::find(targets.begin(), targets.end(), id) != targets.end();
+        };
+        if (owns(owner)) return true;
+        /* Some players host the render window in a child process. */
+        const DWORD parent = ParentProcessId(owner);
+        return parent != 0 && owns(parent);
+    }
+
+    std::wstring process_;
+    std::vector<std::wstring> names_;
+    bool interactive_{false};
+    bool allowed_{true};
+    ULONGLONG last_check_{};
 };
 
 /*
@@ -174,10 +350,24 @@ int SendStopRequest() {
 int main(int argc, char** argv) {
     try {
         WinsockRuntime winsock;
-        if (argc > 1 && std::string_view(argv[1]) == "--stop") return SendStopRequest();
 
-        const std::uint16_t port = argc > 1
-            ? static_cast<std::uint16_t>(std::stoul(argv[1])) : 39871;
+        std::uint16_t port = 39871;
+        std::wstring gate_process;
+        for (int index = 1; index < argc; ++index) {
+            const std::string_view argument(argv[index]);
+            if (argument == "--stop") return SendStopRequest();
+            if (argument == "--gate") {
+                if (index + 1 >= argc) throw std::runtime_error("--gate needs a process name");
+                gate_process = Widen(argv[++index]);
+                if (gate_process.empty()) throw std::runtime_error("empty --gate process name");
+            } else if (!argument.empty() && argument.front() == '-') {
+                throw std::runtime_error("unknown option: " + std::string(argument));
+            } else {
+                port = static_cast<std::uint16_t>(std::stoul(std::string(argument)));
+            }
+        }
+
+        FocusGate gate(gate_process);
         Handle trace(CreateFileW(
             L"C:\\temp\\mtp-trace.csv",
             GENERIC_WRITE,
@@ -188,7 +378,7 @@ int main(int argc, char** argv) {
             nullptr));
         std::size_t trace_rows = 0;
         if (trace.valid()) {
-            WriteTraceLine(trace, "seq,active,reported,scan_100us,button_flags", trace_rows);
+            WriteTraceLine(trace, "seq,active,reported,scan_100us,button_flags,capture_us,x0,y0", trace_rows);
             FlushFileBuffers(trace.get());
         }
 
@@ -236,6 +426,7 @@ int main(int argc, char** argv) {
                 });
             }
             std::array<std::uint8_t, 4096> buffer{};
+            bool gate_released = false;
             try {
                 for (;;) {
                     /* select only has to notice data or the idle timeout; it is
@@ -253,8 +444,13 @@ int main(int argc, char** argv) {
                         break;
                     }
                     if (ready == 0) {
+                        if (!gate.allowed() && !gate_released) {
+                            Submit(driver, session.ForceRelease());
+                            gate_released = true;
+                            std::cout << "focus gate closed; contacts released\n";
+                        }
                         if (const auto release = session.OnTimeout(std::chrono::steady_clock::now())) {
-                            Submit(driver, *release);
+                            if (gate.allowed()) Submit(driver, *release);
                         }
                         continue;
                     }
@@ -268,7 +464,19 @@ int main(int argc, char** argv) {
                         buffer.data(), static_cast<std::size_t>(received)));
                     while (decoder.HasMessage()) {
                         const auto output = session.Process(decoder.PopMessage());
-                        if (output) Submit(driver, *output);
+                        if (!output) continue;
+                        if (gate.allowed()) {
+                            gate_released = false;
+                            Submit(driver, *output);
+                        } else if (!gate_released) {
+                            /* The driver keeps the last report, so a finger or a
+                               button would stay latched while the gate is shut.
+                               Release once, then keep consuming (and dropping)
+                               frames so the MTP1 sequence stays continuous. */
+                            Submit(driver, session.ForceRelease());
+                            gate_released = true;
+                            std::cout << "focus gate closed; contacts released\n";
+                        }
                     }
                 }
             } catch (const std::exception& error) {

@@ -166,13 +166,24 @@ std::optional<MTP_IOCTL_FRAME> TouchSession::Process(const Message& message) {
     output.scan_time_100us = NextScanTime(message.capture_time_us);
 
     if (trace_) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "%u,%u,%u,%u,0x%x",
+        /* capture_time_us and the first contact position are here because a
+           double click is decided by two things the HID report hides: how long
+           the button stayed up between presses, and how far apart the two press
+           positions were. Both are recoverable from these columns. */
+        char line[160];
+        const std::uint16_t first_x =
+            output.report_contact_count != 0 ? output.contacts[0].x : 0;
+        const std::uint16_t first_y =
+            output.report_contact_count != 0 ? output.contacts[0].y : 0;
+        std::snprintf(line, sizeof(line), "%u,%u,%u,%u,0x%x,%llu,%u,%u",
                       output.sequence,
                       static_cast<unsigned>(output.active_contact_count),
                       static_cast<unsigned>(output.report_contact_count),
                       static_cast<unsigned>(output.scan_time_100us),
-                      static_cast<unsigned>(button_flags));
+                      static_cast<unsigned>(button_flags),
+                      static_cast<unsigned long long>(message.capture_time_us),
+                      static_cast<unsigned>(first_x),
+                      static_cast<unsigned>(first_y));
         trace_(line);
     }
     return output;

@@ -119,9 +119,32 @@ nc -vz WINDOWS_IP 39871
 
 On disconnect or a 1.5 s active-contact timeout the receiver releases every contact.
 
+The receiver also takes `--gate PROCESS`, which forwards packets only while that process owns the
+foreground window. It matters when Windows is the client side; without the flag nothing is gated.
+
 The agent does not consume Mac input. To keep the built-in trackpad off the Mac while an external
 mouse is attached, enable "Ignore built-in trackpad when mouse or wireless trackpad is present" in
 Accessibility settings.
+
+### Foreground gate
+
+Reading the panel directly bypasses every focus rule macOS applies to a real trackpad, so the pointer
+keeps landing on the Windows side even when another application is in front. Pass the streaming
+client's bundle identifier to stop that:
+
+```sh
+./build/mac-touch-agent WINDOWS_IP 39871 --gate com.moonlight-stream.Moonlight
+```
+
+The agent polls the frontmost window every 100 ms and forwards nothing unless that application owns
+it. One lift frame goes out the moment the gate closes, so a finger or button that was held is
+released instead of staying stuck until the idle timeout. The value is matched against the bundle
+identifier first, then the localized application name.
+
+Do not use `-[NSWorkspace frontmostApplication]` here. It is refreshed from workspace notifications,
+and a process without an event loop keeps returning whichever application was frontmost at launch,
+which silently pins the gate open. The implementation reads `CGWindowListCopyWindowInfo` instead and
+takes the owner of the first layer-0 window, which is current on every call.
 
 ## Autostart
 

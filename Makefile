@@ -10,9 +10,9 @@ build/mac-capture-probe: mac/Probe/main.c mac/Probe/MultitouchSupportABI.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) mac/Probe/main.c -o $@ $(FRAMEWORKS)
 
-build/mac-touch-agent: mac/Agent/main.c mac/Probe/MultitouchSupportABI.h protocol/TouchFrame.c protocol/TouchFrame.h
+build/mac-touch-agent: mac/Agent/main.c mac/Agent/gate.m mac/Agent/gate.h mac/Probe/MultitouchSupportABI.h protocol/TouchFrame.c protocol/TouchFrame.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Iprotocol -Imac/Probe mac/Agent/main.c protocol/TouchFrame.c -o $@ $(FRAMEWORKS) -lpthread
+	$(CC) $(CFLAGS) -Iprotocol -Imac/Probe mac/Agent/main.c mac/Agent/gate.m protocol/TouchFrame.c -o $@ $(FRAMEWORKS) -framework AppKit -lpthread
 
 build/protocol-test: tests/protocol_test.c protocol/TouchFrame.c protocol/TouchFrame.h
 	@mkdir -p build

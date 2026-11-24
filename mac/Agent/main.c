@@ -1,5 +1,6 @@
 #include "MultitouchSupportABI.h"
 #include "TouchFrame.h"
+#include "gate.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <arpa/inet.h>
@@ -79,6 +80,15 @@ typedef struct {
     pthread_mutex_t frame_mutex;
     FILE *button_trace;
     pthread_mutex_t trace_mutex;
+    /*
+     * Optional foreground gate. Reading the panel directly bypasses every
+     * window-focus rule macOS applies to a real trackpad, so without this the
+     * pointer keeps controlling the remote host while another application owns
+     * the screen. Empty means "always send", which is the previous behaviour.
+     */
+    const char *gate_app;
+    atomic_bool gate_allowed;
+    bool gate_blocked;
 } Agent;
 
 typedef CFArrayRef (*CreateListFn)(void);
@@ -204,7 +214,14 @@ static void trace_button_capability(Agent *agent, bool available) {
     pthread_mutex_unlock(&agent->trace_mutex);
 }
 
-static void enqueue_frame_locked(Agent *agent, TPFrame *frame, const char *origin) {
+static bool gate_open(Agent *agent) {
+    if (agent->gate_app == NULL || agent->gate_app[0] == '\0') {
+        return true;
+    }
+    return atomic_load_explicit(&agent->gate_allowed, memory_order_relaxed);
+}
+
+static void push_frame_locked(Agent *agent, TPFrame *frame, const char *origin) {
     frame->sequence =
         atomic_fetch_add_explicit(&agent->sequence, 1, memory_order_relaxed) + 1;
     frame->capture_time_us = monotonic_microseconds();
@@ -223,6 +240,66 @@ static void enqueue_frame_locked(Agent *agent, TPFrame *frame, const char *origi
         queue_clear(&agent->queue);
         atomic_fetch_add_explicit(&agent->dropped, 1, memory_order_relaxed);
     }
+}
+
+static void enqueue_frame_locked(Agent *agent, TPFrame *frame, const char *origin) {
+    if (!gate_open(agent)) {
+        /*
+         * Send exactly one empty frame when the gate closes. The receiver keeps
+         * the last report it submitted, so a finger or a button that was down at
+         * that moment would stay latched until the 1.5 s idle timeout; this lift
+         * releases it immediately. Nothing is sent afterwards, which also means
+         * no sequence numbers are consumed while the gate is shut.
+         */
+        if (!agent->gate_blocked) {
+            agent->gate_blocked = true;
+            TPFrame release = *frame;
+            release.contact_count = 0;
+            release.flags = 0;
+            push_frame_locked(agent, &release, "gate_close");
+        }
+        return;
+    }
+    agent->gate_blocked = false;
+    push_frame_locked(agent, frame, origin);
+}
+
+/*
+ * The gate cannot be evaluated from the contact callback alone: that callback
+ * only runs while a finger is on the panel, so switching windows with idle
+ * hands left the previous decision in place, and the first frame after the
+ * switch was already forwarded. A dedicated watcher polls the frontmost
+ * application and, the moment the gate closes, pushes one empty frame so the
+ * receiver releases whatever was still held down.
+ */
+static void *gate_watch_main(void *context) {
+    Agent *agent = context;
+    while (atomic_load_explicit(&agent->running, memory_order_relaxed)) {
+        usleep(100000);
+        if (agent->gate_app == NULL) {
+            continue;
+        }
+        char foreground[192];
+        const bool allowed =
+            tp_gate_status(agent->gate_app, foreground, sizeof(foreground)) != 0;
+        const bool previous =
+            atomic_exchange_explicit(&agent->gate_allowed, allowed, memory_order_relaxed);
+        if (allowed == previous) {
+            continue;
+        }
+        fprintf(stderr, "gate %s (frontmost: %s)\n", allowed ? "open" : "closed", foreground);
+        fflush(stderr);
+        if (allowed) {
+            continue;
+        }
+        pthread_mutex_lock(&agent->frame_mutex);
+        TPFrame release = agent->latest_frame;
+        release.contact_count = 0;
+        release.flags = 0;
+        enqueue_frame_locked(agent, &release, "gate_close");
+        pthread_mutex_unlock(&agent->frame_mutex);
+    }
+    return NULL;
 }
 
 static void button_callback(MTDeviceRef device,
@@ -244,6 +321,19 @@ static void button_callback(MTDeviceRef device,
     }
 
     pthread_mutex_lock(&agent->frame_mutex);
+    /*
+     * The clickpad switch is the authoritative release. Drop the pressure latch
+     * here instead of waiting for finger pressure to stay below the release
+     * threshold for N frames: that delay pushed Button 1 back to 0 only tens of
+     * milliseconds after the switch opened, so a quick second click landed
+     * while the button was still down and Windows saw one long press instead of
+     * a double click.
+     */
+    if (released != 0) {
+        agent->pressure_button_down = false;
+        agent->pressure_press_frames = 0;
+        agent->pressure_low_frames = 0;
+    }
     TPFrame frame = agent->latest_frame;
     /* Keep both button bits: rebuilding the flags from only the left button
        dropped a right-click that was already latched. */
@@ -484,7 +574,7 @@ static void contact_callback(MTDeviceRef device,
     } else if (!g_agent.pressure_button_down && g_agent.pressure_threshold > 0) {
         if (maximum_pressure >= g_agent.pressure_threshold) {
             ++g_agent.pressure_press_frames;
-            if (g_agent.pressure_press_frames >= 3) {
+            if (g_agent.pressure_press_frames >= 2) {
                 g_agent.pressure_button_down = true;
                 ++g_agent.pressure_button_events;
                 g_agent.pressure_low_frames = 0;
@@ -536,10 +626,19 @@ static void contact_callback(MTDeviceRef device,
             --g_agent.pressure_button2_press_frames;
         }
     } else if (g_agent.pressure_button2_down) {
+        /*
+         * Two-finger right click keeps a longer hold than Button 1. Button 1 can
+         * release in a couple of frames now because the clickpad switch also
+         * drives it, but Button 2 has no switch behind it -- releasing on a
+         * brief pressure dip would cut the context menu short.
+         */
+        const unsigned release_frames = g_agent.pressure_release_frames > 8u
+                                            ? g_agent.pressure_release_frames
+                                            : 8u;
         if (g_agent.pressure2_release_threshold > 0 &&
             g_agent.last_avg_pressure < g_agent.pressure2_release_threshold) {
             ++g_agent.pressure_button2_low_frames;
-            if (g_agent.pressure_button2_low_frames >= g_agent.pressure_release_frames) {
+            if (g_agent.pressure_button2_low_frames >= release_frames) {
                 g_agent.pressure_button2_down = false;
                 g_agent.pressure_button2_low_frames = 0;
                 g_agent.pressure_button2_press_frames = 0;
@@ -596,9 +695,12 @@ static void *load_symbol(void *framework, const char *name, bool required) {
 static int usage(const char *program) {
     fprintf(stderr,
             "usage: %s HOST [PORT] [--duration SECONDS] [--button-trace PATH] "
+            "[--gate APP] "
             "[--pressure-threshold VALUE] [--pressure-release-threshold VALUE] "
             "[--pressure-release-frames VALUE] [--pressure2-threshold VALUE] "
-            "[--pressure2-release-threshold VALUE]\n",
+            "[--pressure2-release-threshold VALUE]\n"
+            "  --gate APP  only send while APP is the frontmost application, "
+            "matched by bundle identifier or name\n",
             program);
     return 2;
 }
@@ -610,11 +712,12 @@ int main(int argc, char **argv) {
     const char *host = argv[1];
     const char *port = "39871";
     const char *button_trace_path = NULL;
+    const char *gate_app = NULL;
     float pressure_threshold = 90.0f;
     float pressure_release_threshold = 50.0f;
     float pressure2_threshold = 70.0f;
     float pressure2_release_threshold = 45.0f;
-    int pressure_release_frames = 10;
+    int pressure_release_frames = 3;
     int duration = 0;
     bool port_seen = false;
     for (int index = 2; index < argc; ++index) {
@@ -631,6 +734,11 @@ int main(int argc, char **argv) {
                 return usage(argv[0]);
             }
             button_trace_path = argv[index];
+        } else if (strcmp(argv[index], "--gate") == 0) {
+            if (++index >= argc || argv[index][0] == '\0') {
+                return usage(argv[0]);
+            }
+            gate_app = argv[index];
         } else if (strcmp(argv[index], "--pressure-threshold") == 0) {
             if (++index >= argc) {
                 return usage(argv[0]);
@@ -697,6 +805,17 @@ int main(int argc, char **argv) {
     g_agent.pressure_release_frames = (unsigned)pressure_release_frames;
     g_agent.pressure2_threshold = pressure2_threshold;
     g_agent.pressure2_release_threshold = pressure2_release_threshold;
+    g_agent.gate_app = gate_app;
+    atomic_init(&g_agent.gate_allowed, true);
+    if (gate_app != NULL) {
+        char foreground[192];
+        const bool allowed = tp_gate_status(gate_app, foreground, sizeof(foreground)) != 0;
+        atomic_store_explicit(&g_agent.gate_allowed, allowed, memory_order_relaxed);
+        fprintf(stderr, "foreground gate: %s (currently %s, frontmost: %s)\n",
+                gate_app,
+                allowed ? "open" : "closed",
+                foreground);
+    }
     atomic_init(&g_agent.running, true);
     atomic_init(&g_agent.connected, false);
     atomic_init(&g_agent.reconnect_requested, false);
@@ -723,6 +842,13 @@ int main(int argc, char **argv) {
     if (pthread_create(&sender, NULL, sender_main, &g_agent) != 0) {
         fprintf(stderr, "cannot create sender thread\n");
         return 1;
+    }
+    pthread_t gate_watcher;
+    const bool gate_watcher_running =
+        g_agent.gate_app != NULL &&
+        pthread_create(&gate_watcher, NULL, gate_watch_main, &g_agent) == 0;
+    if (g_agent.gate_app != NULL && !gate_watcher_running) {
+        fprintf(stderr, "cannot create gate watcher thread\n");
     }
     void *framework = dlopen(FRAMEWORK_PATH, RTLD_NOW | RTLD_LOCAL);
     if (framework == NULL) {
@@ -803,6 +929,9 @@ int main(int argc, char **argv) {
         }
     }
     pthread_join(sender, NULL);
+    if (gate_watcher_running) {
+        pthread_join(gate_watcher, NULL);
+    }
     fprintf(stderr,
             "summary: captured=%llu sent=%llu dropped=%llu connections=%llu "
             "button_events=%llu pressure_button_events=%llu pressure_button2_events=%llu\n",
