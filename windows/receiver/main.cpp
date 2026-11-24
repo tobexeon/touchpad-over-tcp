@@ -18,6 +18,12 @@
 
 namespace {
 
+/* Loopback-only shutdown channel. Killing the process while a finger or a
+   button is down would leave the driver holding the last report, so shutdown
+   has to go through the same path as a disconnect: release, then exit. A
+   connection to this port means "stop". */
+constexpr std::uint16_t kControlPort = 39872;
+
 class WinsockRuntime {
 public:
     WinsockRuntime() {
@@ -117,13 +123,61 @@ SOCKET CreateServer(std::uint16_t port) {
     return server;
 }
 
+SOCKET CreateControlServer() {
+    SOCKET server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server == INVALID_SOCKET) return INVALID_SOCKET;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(kControlPort);
+    if (bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
+        listen(server, 1) == SOCKET_ERROR) {
+        closesocket(server);
+        return INVALID_SOCKET;
+    }
+    return server;
+}
+
+/* Returns true once someone connected to the control port. The connection
+   itself carries no payload; accept it and drop it. */
+bool PollControl(SOCKET control) {
+    if (control == INVALID_SOCKET) return false;
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(control, &readable);
+    timeval immediate{0, 0};
+    if (select(0, &readable, nullptr, nullptr, &immediate) != 1) return false;
+    SOCKET accepted = accept(control, nullptr, nullptr);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    return true;
+}
+
+int SendStopRequest() {
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET) return 1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(kControlPort);
+    const int result = connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    closesocket(client);
+    if (result == SOCKET_ERROR) {
+        std::cout << "receiver is not running\n";
+        return 0;
+    }
+    std::cout << "stop requested\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
+        WinsockRuntime winsock;
+        if (argc > 1 && std::string_view(argv[1]) == "--stop") return SendStopRequest();
+
         const std::uint16_t port = argc > 1
             ? static_cast<std::uint16_t>(std::stoul(argv[1])) : 39871;
-        WinsockRuntime winsock;
         Handle trace(CreateFileW(
             L"C:\\temp\\mtp-trace.csv",
             GENERIC_WRITE,
@@ -147,8 +201,27 @@ int main(int argc, char** argv) {
         }
 
         SOCKET server = CreateServer(port);
-        std::cout << "listening on TCP " << port << '\n';
+        SOCKET control = CreateControlServer();
+        std::cout << "listening on TCP " << port;
+        if (control != INVALID_SOCKET) {
+            std::cout << ", control on 127.0.0.1:" << kControlPort;
+        }
+        std::cout << '\n';
+
+        bool stopping = false;
         for (;;) {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(server, &readable);
+            timeval idle{0, 200000};
+            const int waiting = select(0, &readable, nullptr, nullptr, &idle);
+            if (waiting == SOCKET_ERROR) throw std::runtime_error("select failed");
+            if (PollControl(control)) {
+                stopping = true;
+                break;
+            }
+            if (waiting == 0) continue;
+
             SOCKET client = accept(server, nullptr, nullptr);
             if (client == INVALID_SOCKET) throw std::runtime_error("accept failed");
             DWORD nodelay = 1;
@@ -167,13 +240,17 @@ int main(int argc, char** argv) {
                 for (;;) {
                     /* select only has to notice data or the idle timeout; it is
                        no longer driving any animation, so 100 ms is fine. */
-                    fd_set readable;
-                    FD_ZERO(&readable);
-                    FD_SET(client, &readable);
-                    timeval idle{0, 100000};
-                    const int ready = select(0, &readable, nullptr, nullptr, &idle);
+                    fd_set readable_client;
+                    FD_ZERO(&readable_client);
+                    FD_SET(client, &readable_client);
+                    timeval idle_client{0, 100000};
+                    const int ready = select(0, &readable_client, nullptr, nullptr, &idle_client);
                     if (ready == SOCKET_ERROR) {
                         throw std::runtime_error("select failed");
+                    }
+                    if (PollControl(control)) {
+                        stopping = true;
+                        break;
                     }
                     if (ready == 0) {
                         if (const auto release = session.OnTimeout(std::chrono::steady_clock::now())) {
@@ -202,7 +279,12 @@ int main(int argc, char** argv) {
             PrintDriverStatus(driver);
             closesocket(client);
             std::cout << "client disconnected\n";
+            if (stopping) break;
         }
+        if (stopping) std::cout << "control port requested shutdown; contacts released\n";
+        if (control != INVALID_SOCKET) closesocket(control);
+        closesocket(server);
+        return 0;
     } catch (const std::exception& error) {
         std::cerr << "fatal: " << error.what() << '\n';
         return 1;

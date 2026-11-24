@@ -123,6 +123,58 @@ The agent does not consume Mac input. To keep the built-in trackpad off the Mac 
 mouse is attached, enable "Ignore built-in trackpad when mouse or wireless trackpad is present" in
 Accessibility settings.
 
+## Autostart
+
+macOS keeps the agent running through a launch agent. Install the binary somewhere stable, then drop
+a plist in `~/Library/LaunchAgents`. Replace `/Users/you` and the address with your own:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>local.touchpad-over-tcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/bin/mac-touch-agent</string>
+        <string>WINDOWS_IP</string>
+        <string>39871</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>StandardErrorPath</key><string>/Users/you/Library/Logs/touchpad-over-tcp/agent.log</string>
+</dict>
+</plist>
+```
+
+```sh
+install -m 755 build/mac-touch-agent ~/bin/mac-touch-agent
+mkdir -p ~/Library/Logs/touchpad-over-tcp
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.touchpad-over-tcp.plist
+launchctl kickstart -k gui/$(id -u)/local.touchpad-over-tcp
+```
+
+The agent retries the connection once per second and stays quiet while Windows is unreachable, so it
+can run permanently.
+
+On Windows, start the receiver only while you are streaming. `deploy/windows/` has two wrappers that
+hide the console; put `mtp-receiver.exe` next to them and call them from Sunshine's command
+preparations (or a stream deck, or a shortcut):
+
+```text
+do:    deploy\windows\start-receiver.cmd
+undo:  deploy\windows\stop-receiver.cmd
+```
+
+`mtp-receiver.exe --stop` connects to `127.0.0.1:39872` and asks the running instance to release every
+contact and exit, so stopping never leaves a finger or a button latched in the driver. Killing the
+process instead leaves the last report in place until the next start.
+
+Both wrappers need the receiver to run as administrator, because the driver's device object is only
+open to SYSTEM and Administrators. In Sunshine, enable "Run as Admin" for the preparation command.
+
 ## Docs
 
 - `docs/WINDOWS_SETUP.zh-CN.md` — driver install walkthrough (Chinese)
