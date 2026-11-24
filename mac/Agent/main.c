@@ -36,6 +36,12 @@ typedef struct {
     pthread_cond_t available;
 } MessageQueue;
 
+typedef CFArrayRef (*CreateListFn)(void);
+typedef void (*RegisterCallbackFn)(MTDeviceRef, MTContactFrameCallback);
+typedef void (*RegisterButtonCallbackFn)(MTDeviceRef, MTButtonStateCallback, void *);
+typedef void (*StartFn)(MTDeviceRef, int32_t);
+typedef bool (*IsBuiltInFn)(MTDeviceRef);
+
 typedef struct {
     const char *host;
     const char *port;
@@ -96,18 +102,18 @@ typedef struct {
      */
     bool gate_stop_capture;
     bool capture_enabled;
+    uint64_t capture_retry_at;
     MTDeviceRef devices[8];
     size_t device_count;
+    CFArrayRef device_list;
     MTDeviceStartFn start_device;
     MTDeviceStopFn stop_device;
     MTDeviceIsRunningFn is_running_device;
+    CreateListFn create_list;
+    RegisterCallbackFn register_callback;
+    RegisterButtonCallbackFn register_button_callback;
+    IsBuiltInFn is_built_in;
 } Agent;
-
-typedef CFArrayRef (*CreateListFn)(void);
-typedef void (*RegisterCallbackFn)(MTDeviceRef, MTContactFrameCallback);
-typedef void (*RegisterButtonCallbackFn)(MTDeviceRef, MTButtonStateCallback, void *);
-typedef void (*StartFn)(MTDeviceRef, int32_t);
-typedef bool (*IsBuiltInFn)(MTDeviceRef);
 
 static Agent g_agent;
 
@@ -276,12 +282,87 @@ static void enqueue_frame_locked(Agent *agent, TPFrame *frame, const char *origi
     push_frame_locked(agent, frame, origin);
 }
 
+static void contact_callback(MTDeviceRef device,
+                             MTTouch *touches,
+                             size_t touch_count,
+                             double timestamp,
+                             size_t frame_number);
+static void button_callback(MTDeviceRef device,
+                            int32_t pressed,
+                            int32_t released,
+                            void *context);
+
+static void EnrollDevices(Agent *agent, CFArrayRef devices) {
+    agent->device_count = 0;
+    const CFIndex total = CFArrayGetCount(devices);
+    for (CFIndex device_index = 0; device_index < total; ++device_index) {
+        MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(devices, device_index);
+        if (agent->is_built_in != NULL && !agent->is_built_in(device)) {
+            continue;
+        }
+        agent->register_callback(device, contact_callback);
+        if (agent->register_button_callback != NULL) {
+            agent->register_button_callback(device, button_callback, agent);
+        }
+        agent->start_device(device, 0);
+        if (agent->device_count < sizeof(agent->devices) / sizeof(agent->devices[0])) {
+            agent->devices[agent->device_count++] = device;
+        }
+    }
+}
+
+/*
+ * A device object survives MTDeviceStop, but after enough stop/start cycles the
+ * framework stops honouring MTDeviceStart on it: MTDeviceIsRunning stays false
+ * and no contact ever arrives again, while the process still looks healthy.
+ * Re-enumerating hands back a fresh object that starts normally; that is the
+ * only recovery that worked when the refusal was first observed.
+ */
+static void RebuildDevices(Agent *agent) {
+    if (agent->create_list == NULL || agent->register_callback == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < agent->device_count; ++index) {
+        if (agent->stop_device != NULL) {
+            agent->stop_device(agent->devices[index]);
+        }
+    }
+    agent->device_count = 0;
+    if (agent->device_list != NULL) {
+        CFRelease(agent->device_list);
+        agent->device_list = NULL;
+    }
+    usleep(50000);
+    CFArrayRef devices = agent->create_list();
+    if (devices == NULL) {
+        fprintf(stderr, "warning: device list rebuild returned nothing\n");
+        fflush(stderr);
+        return;
+    }
+    CFRetain(devices);
+    agent->device_list = devices;
+    EnrollDevices(agent, devices);
+    fprintf(stderr, "rebuilt device list: %zu device(s)\n", agent->device_count);
+    fflush(stderr);
+}
+
+static bool DevicesRunning(const Agent *agent) {
+    if (agent->is_running_device == NULL) {
+        return agent->device_count > 0;
+    }
+    for (size_t index = 0; index < agent->device_count; ++index) {
+        if (agent->is_running_device(agent->devices[index])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Stopping the device stream is the only way to stop the framework from waking
  * this process every 8 ms to deliver contacts that would be discarded anyway.
- * The callback registration survives MTDeviceStop on the devices seen so far,
- * but a start that does not take effect is retried and reported rather than
- * left silent: losing the panel is far worse than one extra attempt.
+ * A start that does not take effect is retried, then recovered by rebuilding
+ * the device list: losing the panel is far worse than one extra attempt.
  */
 static void ApplyCaptureState(Agent *agent, bool enabled) {
     if (!agent->gate_stop_capture || agent->device_count == 0 ||
@@ -291,24 +372,44 @@ static void ApplyCaptureState(Agent *agent, bool enabled) {
     if (agent->capture_enabled == enabled) {
         return;
     }
-    for (size_t index = 0; index < agent->device_count; ++index) {
-        MTDeviceRef device = agent->devices[index];
-        if (!enabled) {
-            agent->stop_device(device);
-            continue;
+    if (enabled && monotonic_microseconds() < agent->capture_retry_at) {
+        return;
+    }
+    if (!enabled) {
+        for (size_t index = 0; index < agent->device_count; ++index) {
+            agent->stop_device(agent->devices[index]);
         }
-        agent->start_device(device, 0);
-        if (agent->is_running_device != NULL && !agent->is_running_device(device)) {
-            agent->start_device(device, 0);
-            if (!agent->is_running_device(device)) {
-                fprintf(stderr, "warning: device %zu refused to restart\n", index);
-            }
+        agent->capture_enabled = false;
+        fprintf(stderr, "capture stopped for %zu device(s), captured=%llu so far\n",
+                agent->device_count,
+                (unsigned long long)atomic_load_explicit(&agent->captured, memory_order_relaxed));
+        fflush(stderr);
+        return;
+    }
+    for (size_t index = 0; index < agent->device_count; ++index) {
+        agent->start_device(agent->devices[index], 0);
+    }
+    if (!DevicesRunning(agent)) {
+        usleep(50000);
+        for (size_t index = 0; index < agent->device_count; ++index) {
+            agent->start_device(agent->devices[index], 0);
         }
     }
-    agent->capture_enabled = enabled;
-    fprintf(stderr, "capture %s for %zu device(s), captured=%llu so far\n",
-            enabled ? "started" : "stopped",
+    if (!DevicesRunning(agent)) {
+        fprintf(stderr, "warning: device refused to restart, rebuilding list\n");
+        fflush(stderr);
+        RebuildDevices(agent);
+    }
+    const bool running = DevicesRunning(agent);
+    agent->capture_enabled = running;
+    if (!running) {
+        /* Keep the watcher retrying instead of leaving the panel dead. */
+        agent->capture_retry_at = monotonic_microseconds() + 2000000ULL;
+    }
+    fprintf(stderr, "capture %s for %zu device(s), running=%s, captured=%llu so far\n",
+            running ? "started" : "failed",
             agent->device_count,
+            running ? "yes" : "no",
             (unsigned long long)atomic_load_explicit(&agent->captured, memory_order_relaxed));
     fflush(stderr);
 }
@@ -333,13 +434,21 @@ static void *gate_watch_main(void *context) {
             tp_gate_status(agent->gate_app, foreground, sizeof(foreground)) != 0;
         const bool previous =
             atomic_exchange_explicit(&agent->gate_allowed, allowed, memory_order_relaxed);
-        if (allowed == previous) {
+        const bool changed = allowed != previous;
+        if (changed) {
+            fprintf(stderr, "gate %s (frontmost: %s)\n", allowed ? "open" : "closed", foreground);
+            fflush(stderr);
+        }
+        if (allowed) {
+            /*
+             * Cheap while the panel is healthy (capture_enabled short circuits),
+             * and the only place that notices a device that was stopped behind
+             * our back by the framework.
+             */
+            ApplyCaptureState(agent, true);
             continue;
         }
-        fprintf(stderr, "gate %s (frontmost: %s)\n", allowed ? "open" : "closed", foreground);
-        fflush(stderr);
-        if (allowed) {
-            ApplyCaptureState(agent, true);
+        if (!changed) {
             continue;
         }
         pthread_mutex_lock(&agent->frame_mutex);
@@ -945,27 +1054,19 @@ int main(int argc, char **argv) {
     CFArrayRef devices = create_list();
     if (devices != NULL) {
         CFRetain(devices);
+        g_agent.device_list = devices;
     }
     int started = 0;
     g_agent.start_device = start;
     g_agent.stop_device = stop;
     g_agent.is_running_device = is_running;
+    g_agent.create_list = create_list;
+    g_agent.register_callback = register_callback;
+    g_agent.register_button_callback = register_button_callback;
+    g_agent.is_built_in = is_built_in;
     if (devices != NULL) {
-        for (CFIndex device_index = 0; device_index < CFArrayGetCount(devices); ++device_index) {
-            MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(devices, device_index);
-            if (is_built_in != NULL && !is_built_in(device)) {
-                continue;
-            }
-            register_callback(device, contact_callback);
-            if (register_button_callback != NULL) {
-                register_button_callback(device, button_callback, &g_agent);
-            }
-            start(device, 0);
-            if (g_agent.device_count < sizeof(g_agent.devices) / sizeof(g_agent.devices[0])) {
-                g_agent.devices[g_agent.device_count++] = device;
-            }
-            ++started;
-        }
+        EnrollDevices(&g_agent, devices);
+        started = (int)g_agent.device_count;
     }
     fflush(stdout);
     if (saved_stdout >= 0) {
@@ -994,8 +1095,28 @@ int main(int argc, char **argv) {
             pressure_release_threshold,
             (unsigned)pressure_release_frames);
     const uint64_t started_at = monotonic_microseconds();
+    uint64_t next_stats_at = started_at + 60000000ULL;
     while (atomic_load_explicit(&g_agent.running, memory_order_relaxed)) {
         usleep(100000);
+        if (g_agent.capture_enabled && !DevicesRunning(&g_agent)) {
+            fprintf(stderr, "warning: device stopped, recovering capture\n");
+            fflush(stderr);
+            g_agent.capture_enabled = false;
+            ApplyCaptureState(&g_agent, true);
+        }
+        if (monotonic_microseconds() >= next_stats_at) {
+            next_stats_at = monotonic_microseconds() + 60000000ULL;
+            fprintf(stderr,
+                    "stats: captured=%llu sent=%llu dropped=%llu reconnects=%llu "
+                    "capture=%s running=%s\n",
+                    (unsigned long long)atomic_load_explicit(&g_agent.captured, memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&g_agent.sent, memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&g_agent.dropped, memory_order_relaxed),
+                    (unsigned long long)atomic_load_explicit(&g_agent.reconnects, memory_order_relaxed),
+                    g_agent.capture_enabled ? "on" : "off",
+                    DevicesRunning(&g_agent) ? "yes" : "no");
+            fflush(stderr);
+        }
         if (duration > 0 && monotonic_microseconds() - started_at >= (uint64_t)duration * 1000000ULL) {
             stop_agent(0);
         }
