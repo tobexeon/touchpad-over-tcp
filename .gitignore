@@ -1,0 +1,15 @@
+.DS_Store
+build/
+out/
+*.log
+*.jsonl
+*.obj
+*.pdb
+*.ilk
+*.user
+*.pfx
+*.cer
+*.pvk
+third_party/
+windows/driver/obj/
+windows/driver/x64/
