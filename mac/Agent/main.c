@@ -89,6 +89,18 @@ typedef struct {
     const char *gate_app;
     atomic_bool gate_allowed;
     bool gate_blocked;
+    /*
+     * Stopping the device stream while the gate is shut removes the remaining
+     * cost of the feature: without it the framework still wakes this process
+     * every 8 ms to deliver contacts that are immediately discarded.
+     */
+    bool gate_stop_capture;
+    bool capture_enabled;
+    MTDeviceRef devices[8];
+    size_t device_count;
+    MTDeviceStartFn start_device;
+    MTDeviceStopFn stop_device;
+    MTDeviceIsRunningFn is_running_device;
 } Agent;
 
 typedef CFArrayRef (*CreateListFn)(void);
@@ -265,6 +277,43 @@ static void enqueue_frame_locked(Agent *agent, TPFrame *frame, const char *origi
 }
 
 /*
+ * Stopping the device stream is the only way to stop the framework from waking
+ * this process every 8 ms to deliver contacts that would be discarded anyway.
+ * The callback registration survives MTDeviceStop on the devices seen so far,
+ * but a start that does not take effect is retried and reported rather than
+ * left silent: losing the panel is far worse than one extra attempt.
+ */
+static void ApplyCaptureState(Agent *agent, bool enabled) {
+    if (!agent->gate_stop_capture || agent->device_count == 0 ||
+        agent->start_device == NULL || agent->stop_device == NULL) {
+        return;
+    }
+    if (agent->capture_enabled == enabled) {
+        return;
+    }
+    for (size_t index = 0; index < agent->device_count; ++index) {
+        MTDeviceRef device = agent->devices[index];
+        if (!enabled) {
+            agent->stop_device(device);
+            continue;
+        }
+        agent->start_device(device, 0);
+        if (agent->is_running_device != NULL && !agent->is_running_device(device)) {
+            agent->start_device(device, 0);
+            if (!agent->is_running_device(device)) {
+                fprintf(stderr, "warning: device %zu refused to restart\n", index);
+            }
+        }
+    }
+    agent->capture_enabled = enabled;
+    fprintf(stderr, "capture %s for %zu device(s), captured=%llu so far\n",
+            enabled ? "started" : "stopped",
+            agent->device_count,
+            (unsigned long long)atomic_load_explicit(&agent->captured, memory_order_relaxed));
+    fflush(stderr);
+}
+
+/*
  * The gate cannot be evaluated from the contact callback alone: that callback
  * only runs while a finger is on the panel, so switching windows with idle
  * hands left the previous decision in place, and the first frame after the
@@ -290,6 +339,7 @@ static void *gate_watch_main(void *context) {
         fprintf(stderr, "gate %s (frontmost: %s)\n", allowed ? "open" : "closed", foreground);
         fflush(stderr);
         if (allowed) {
+            ApplyCaptureState(agent, true);
             continue;
         }
         pthread_mutex_lock(&agent->frame_mutex);
@@ -298,6 +348,7 @@ static void *gate_watch_main(void *context) {
         release.flags = 0;
         enqueue_frame_locked(agent, &release, "gate_close");
         pthread_mutex_unlock(&agent->frame_mutex);
+        ApplyCaptureState(agent, false);
     }
     return NULL;
 }
@@ -695,12 +746,14 @@ static void *load_symbol(void *framework, const char *name, bool required) {
 static int usage(const char *program) {
     fprintf(stderr,
             "usage: %s HOST [PORT] [--duration SECONDS] [--button-trace PATH] "
-            "[--gate APP] "
+            "[--gate APP] [--gate-keep-capturing] "
             "[--pressure-threshold VALUE] [--pressure-release-threshold VALUE] "
             "[--pressure-release-frames VALUE] [--pressure2-threshold VALUE] "
             "[--pressure2-release-threshold VALUE]\n"
             "  --gate APP  only send while APP is the frontmost application, "
-            "matched by bundle identifier or name\n",
+            "matched by bundle identifier or name\n"
+            "  --gate-keep-capturing  keep the device stream running while the "
+            "gate is shut (default stops it)\n",
             program);
     return 2;
 }
@@ -720,6 +773,7 @@ int main(int argc, char **argv) {
     int pressure_release_frames = 3;
     int duration = 0;
     bool port_seen = false;
+    bool gate_stop_capture = true;
     for (int index = 2; index < argc; ++index) {
         if (strcmp(argv[index], "--duration") == 0) {
             if (++index >= argc) {
@@ -739,6 +793,8 @@ int main(int argc, char **argv) {
                 return usage(argv[0]);
             }
             gate_app = argv[index];
+        } else if (strcmp(argv[index], "--gate-keep-capturing") == 0) {
+            gate_stop_capture = false;
         } else if (strcmp(argv[index], "--pressure-threshold") == 0) {
             if (++index >= argc) {
                 return usage(argv[0]);
@@ -806,6 +862,8 @@ int main(int argc, char **argv) {
     g_agent.pressure2_threshold = pressure2_threshold;
     g_agent.pressure2_release_threshold = pressure2_release_threshold;
     g_agent.gate_app = gate_app;
+    g_agent.gate_stop_capture = gate_stop_capture;
+    g_agent.capture_enabled = true;
     atomic_init(&g_agent.gate_allowed, true);
     if (gate_app != NULL) {
         char foreground[192];
@@ -862,12 +920,16 @@ int main(int argc, char **argv) {
     RegisterButtonCallbackFn register_button_callback = NULL;
     StartFn start = NULL;
     IsBuiltInFn is_built_in = NULL;
+    MTDeviceStopFn stop = NULL;
+    MTDeviceIsRunningFn is_running = NULL;
     *(void **)(&create_list) = load_symbol(framework, "MTDeviceCreateList", true);
     *(void **)(&register_callback) = load_symbol(framework, "MTRegisterContactFrameCallback", true);
     *(void **)(&register_button_callback) =
         load_symbol(framework, "MTRegisterButtonStateCallback", false);
     *(void **)(&start) = load_symbol(framework, "MTDeviceStart", true);
     *(void **)(&is_built_in) = load_symbol(framework, "MTDeviceIsBuiltIn", false);
+    *(void **)(&stop) = load_symbol(framework, "MTDeviceStop", false);
+    *(void **)(&is_running) = load_symbol(framework, "MTDeviceIsRunning", false);
     if (create_list == NULL || register_callback == NULL || start == NULL) {
         stop_agent(0);
         pthread_join(sender, NULL);
@@ -885,6 +947,9 @@ int main(int argc, char **argv) {
         CFRetain(devices);
     }
     int started = 0;
+    g_agent.start_device = start;
+    g_agent.stop_device = stop;
+    g_agent.is_running_device = is_running;
     if (devices != NULL) {
         for (CFIndex device_index = 0; device_index < CFArrayGetCount(devices); ++device_index) {
             MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(devices, device_index);
@@ -896,6 +961,9 @@ int main(int argc, char **argv) {
                 register_button_callback(device, button_callback, &g_agent);
             }
             start(device, 0);
+            if (g_agent.device_count < sizeof(g_agent.devices) / sizeof(g_agent.devices[0])) {
+                g_agent.devices[g_agent.device_count++] = device;
+            }
             ++started;
         }
     }
@@ -909,6 +977,10 @@ int main(int argc, char **argv) {
         stop_agent(0);
         pthread_join(sender, NULL);
         return 1;
+    }
+    /* Devices start enabled; if the gate is already shut, shut them again. */
+    if (!gate_open(&g_agent)) {
+        ApplyCaptureState(&g_agent, false);
     }
 
     fprintf(stderr,

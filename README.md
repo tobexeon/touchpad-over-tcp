@@ -141,6 +141,12 @@ it. One lift frame goes out the moment the gate closes, so a finger or button th
 released instead of staying stuck until the idle timeout. The value is matched against the bundle
 identifier first, then the localized application name.
 
+Closing the gate also stops the device stream (`MTDeviceStop`), because otherwise the framework keeps
+waking the process every 8 ms to deliver contacts that are discarded. Measured over 6 s with the gate
+shut, the contact callback count does not move at all and the framework drops one worker thread.
+Pass `--gate-keep-capturing` to keep the stream running instead; the first frame after reopening the
+gate then has no restart latency.
+
 Do not use `-[NSWorkspace frontmostApplication]` here. It is refreshed from workspace notifications,
 and a process without an event loop keeps returning whichever application was frontmost at launch,
 which silently pins the gate open. The implementation reads `CGWindowListCopyWindowInfo` instead and

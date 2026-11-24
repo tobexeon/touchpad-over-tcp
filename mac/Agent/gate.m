@@ -3,6 +3,7 @@
 #include <libproc.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "gate.h"
 
@@ -62,25 +63,50 @@ static pid_t ParentPid(pid_t pid) {
 }
 
 static int MatchesProcess(pid_t pid, const char *needle) {
-    if (pid <= 0) {
-        return 0;
-    }
-    NSRunningApplication *application =
-        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-    if (application == nil) {
+    if (pid <= 0 || needle == NULL || needle[0] == '\0') {
         return 0;
     }
     NSString *wanted = [NSString stringWithUTF8String:needle];
     if (wanted == nil) {
         return 0;
     }
-    if (application.bundleIdentifier != nil &&
-        [application.bundleIdentifier caseInsensitiveCompare:wanted] == NSOrderedSame) {
+    NSRunningApplication *application =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (application != nil) {
+        if (application.bundleIdentifier != nil &&
+            [application.bundleIdentifier caseInsensitiveCompare:wanted] == NSOrderedSame) {
+            return 1;
+        }
+        if (application.localizedName != nil &&
+            [application.localizedName caseInsensitiveCompare:wanted] == NSOrderedSame) {
+            return 1;
+        }
+    }
+    /*
+     * -runningApplicationWithProcessIdentifier: returns nil for a process the
+     * workspace has not registered yet, which happens right after a launch and
+     * showed up in testing as a spurious "[?]" bundle. Fall back to the
+     * executable path so a freshly started client is not locked out.
+     */
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(pid, path, sizeof(path)) <= 0) {
+        return 0;
+    }
+    const char *executable = strrchr(path, '/');
+    executable = executable != NULL ? executable + 1 : path;
+    if (strcasecmp(executable, needle) == 0) {
         return 1;
     }
-    if (application.localizedName != nil &&
-        [application.localizedName caseInsensitiveCompare:wanted] == NSOrderedSame) {
-        return 1;
+    const char *bundle_end = strstr(path, ".app/");
+    if (bundle_end != NULL) {
+        const char *bundle_start = bundle_end;
+        while (bundle_start > path && bundle_start[-1] != '/') {
+            --bundle_start;
+        }
+        const size_t length = (size_t)(bundle_end - bundle_start);
+        if (strlen(needle) == length && strncasecmp(bundle_start, needle, length) == 0) {
+            return 1;
+        }
     }
     return 0;
 }

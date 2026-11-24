@@ -51,6 +51,8 @@ typedef void (*MTButtonStateCallback)(MTDeviceRef device,
 typedef CFArrayRef (*MTDeviceCreateListFn)(void);
 typedef void (*MTRegisterContactFrameCallbackFn)(MTDeviceRef, MTContactFrameCallback);
 typedef void (*MTDeviceStartFn)(MTDeviceRef, int32_t);
+typedef void (*MTDeviceStopFn)(MTDeviceRef);
+typedef bool (*MTDeviceIsRunningFn)(MTDeviceRef);
 typedef bool (*MTDeviceIsBuiltInFn)(MTDeviceRef);
 
 _Static_assert(sizeof(MTPoint) == 8, "Unexpected MTPoint layout");
