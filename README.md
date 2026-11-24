@@ -123,6 +123,13 @@ The agent does not consume Mac input. To keep the built-in trackpad off the Mac 
 mouse is attached, enable "Ignore built-in trackpad when mouse or wireless trackpad is present" in
 Accessibility settings.
 
+## Docs
+
+- `docs/WINDOWS_SETUP.zh-CN.md` — driver install walkthrough (Chinese)
+- `docs/MAC_SETUP.md` — capture and agent setup
+- `docs/VHF_STARTUP_ISSUE.md` — why the device can come up with Device Manager Code 10
+- `docs/OPEN_SOURCE_REUSE.md` — which upstream implementations were studied and why
+
 ## Security notes
 
 The link is plaintext TCP with no authentication. Keep port 39871 on a private network, do not
